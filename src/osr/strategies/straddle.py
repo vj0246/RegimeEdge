@@ -114,17 +114,16 @@ def atm_iv(panel: pd.DataFrame, auctions: pd.DataFrame) -> pd.Series:
     prices), else among all strikes (settlement prices). Discounted at the latest 91-day yield."""
     expiries = monthly_expiries(panel)
     fut_settle = panel.loc[panel["instrument"] == "FUT"].set_index(["date", "expiry"])["settle"]
-    opt = panel.loc[(panel["instrument"] == "OPT") & panel["expiry"].isin(expiries)]
-    by_day = dict(tuple(opt.groupby(["date", "expiry"])))
+    dates = pd.DatetimeIndex(sorted(panel["date"].unique()))
+    pos = expiries.searchsorted(dates + pd.Timedelta(days=IV_MIN_DAYS))
+    target = pd.Series(expiries[pos[pos < len(expiries)]], index=dates[pos < len(expiries)])
+    opt = panel.loc[panel["instrument"] == "OPT"]
+    opt = opt[opt["expiry"].to_numpy() == target.reindex(opt["date"]).to_numpy()]  # only each day's target chain
     y = auctions.set_index("date")["yield_pct"].sort_index() / 100
     out = {}
-    for d in sorted(panel["date"].unique()):
-        later = expiries[expiries >= d + pd.Timedelta(days=IV_MIN_DAYS)]
-        if later.empty or (d, later[0]) not in by_day:
-            continue
-        e = later[0]
+    for d, chain in opt.groupby("date"):
+        e = target[d]
         forward, rate = fut_settle.get((d, e), np.nan), y[:d].iloc[-1] if (y.index <= d).any() else np.nan
-        chain = by_day[(d, e)]
         traded = chain[chain["volume"] > 0].pivot_table(index="strike", columns="opt_type", values="close").dropna()
         table = traded if {"CE", "PE"} <= set(traded.columns) and len(traded) else \
             chain.pivot_table(index="strike", columns="opt_type", values="settle").dropna()

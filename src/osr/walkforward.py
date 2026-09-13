@@ -9,7 +9,7 @@ import hashlib
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +37,8 @@ JM_VALIDATION = pd.DateOffset(years=8)
 JM_MIN_VALIDATION_DAYS = 3 * 252
 IV_MIN_HISTORY = 250
 LAGS = (1, 2)
+PANEL_COLUMNS = ["date", "instrument", "expiry", "strike", "opt_type", "close", "settle", "volume"]
+NEAR_DAYS = 70
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,15 @@ def load_inputs(end: pd.Timestamp) -> Inputs:
     rf = daily_cash_return(auctions, close.index).fillna(0.0)
     x = detector_inputs(np.log(close).diff().dropna(), rf)
     tri = pd.read_parquet(p / "nifty50_tri.parquet").set_index("date")["tri"]
-    panel = pd.read_parquet(p / "nifty_fo.parquet", filters=[("date", "<=", end)])
+    fo = p / "nifty_fo.parquet"
+    fut = pd.read_parquet(fo, columns=PANEL_COLUMNS, filters=[("instrument", "==", "FUT"), ("date", "<=", end)])
+    monthly = [pd.Timestamp(e) for e in sorted(fut["expiry"].unique())]
+    # Memory: only monthly contracts within NEAR_DAYS of expiry are ever used (cycle legs expire within about 36
+    # days of entry; the IV contract within 42 days), so weeklies and long-dated rows are dropped at load.
+    opt = pd.read_parquet(fo, columns=PANEL_COLUMNS,
+                          filters=[("instrument", "==", "OPT"), ("date", "<=", end), ("expiry", "in", monthly)])
+    opt = opt[(opt["expiry"] - opt["date"]).dt.days <= NEAR_DAYS]
+    panel = pd.concat([fut, opt], ignore_index=True)
     expiries = straddle.monthly_expiries(panel)
     return Inputs(x, rf, tri[tri.index <= end], panel, auctions, expiries[expiries <= end])
 
@@ -111,20 +121,23 @@ def all_gates(inp: Inputs, workers: int) -> tuple[dict[str, pd.Series], pd.Serie
     return gates, chosen
 
 
-def period_returns(inp: Inputs, gates: dict[str, pd.Series], start: pd.Timestamp, end: pd.Timestamp, lag: int,
-                   tier: str, half_spread: float) -> tuple[pd.DataFrame, pd.DataFrame, straddle.Plan]:
+def period_plan(inp: Inputs, start: pd.Timestamp) -> straddle.Plan:
+    sub = inp.panel[inp.panel["date"] >= start]
+    return straddle.build_plan(sub, daily_cash_return(inp.auctions, pd.DatetimeIndex(sorted(sub["date"].unique()))))
+
+
+def period_returns(inp: Inputs, gates: dict[str, pd.Series], plan: straddle.Plan, start: pd.Timestamp,
+                   end: pd.Timestamp, lag: int, tier: str, half_spread: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Daily returns of every family member, from the first day on which every gate has a signal."""
     rf_tri = inp.rf.reindex(inp.tri.index).fillna(0.0)
     t_gates = {k: v for k, v in gates.items() if k != "IV"}
     t_ret = pd.DataFrame({"ungated": tri_returns(inp.tri, rf_tri),
                           **{k: tri_returns(inp.tri, rf_tri, g, lag, *TRI_TIERS[tier]) for k, g in t_gates.items()}})
-    sub = inp.panel[inp.panel["date"] >= start]
-    plan = straddle.build_plan(sub, daily_cash_return(inp.auctions, pd.DatetimeIndex(sorted(sub["date"].unique()))))
     s_ret = pd.DataFrame({"ungated": straddle.simulate(plan, None, lag, half_spread),
                           **{k: straddle.simulate(plan, g.reindex(plan.dates).to_numpy(), lag, half_spread)
                              for k, g in gates.items()}})
     lo = max(start, *(g.first_valid_index() for g in gates.values()))
-    return t_ret.loc[lo:end], s_ret.loc[lo:end], plan
+    return t_ret.loc[lo:end], s_ret.loc[lo:end]
 
 
 def record(out: Path, name: str, returns: pd.DataFrame, rf: pd.Series, config: dict, manifest_sha: str) -> pd.DataFrame:
@@ -143,7 +156,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("period", choices=["dev", "sealed"])
-    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    parser.add_argument("--workers", type=int, default=max(1, min(6, (os.cpu_count() or 2) - 1)))
     args = parser.parse_args()
 
     if args.period == "sealed":
@@ -156,6 +169,8 @@ def main() -> None:
     manifest_sha = hashlib.sha256((settings.data_dir / "manifest.json").read_bytes()).hexdigest()
     inp = load_inputs(end)
     gates, chosen = all_gates(inp, args.workers)
+    plan = period_plan(inp, start)
+    inp = replace(inp, panel=inp.panel.iloc[:0])  # the panel is not needed after the plan and IV
     run_id = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
     out = settings.data_dir / "results" / args.period / run_id
     out.mkdir(parents=True, exist_ok=True)
@@ -164,7 +179,7 @@ def main() -> None:
 
     for lag in LAGS:
         for tier, spread in zip(("headline", "delivery", "stress"), ("headline", "low", "high")):
-            t_ret, s_ret, plan = period_returns(inp, gates, start, end, lag, tier, HALF_SPREAD[spread])
+            t_ret, s_ret = period_returns(inp, gates, plan, start, end, lag, tier, HALF_SPREAD[spread])
             base = {"period": args.period, "run_id": run_id, "lag": lag, "smooth_k": SMOOTH_K,
                     "jm_penalties": JM_PENALTIES}
             rf_s = pd.Series(plan.rf, index=plan.dates)
