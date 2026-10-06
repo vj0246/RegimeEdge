@@ -67,4 +67,4 @@ Power statement in the abstract; rolling-refit label stability (the most origina
 
 ## 7. Status
 
-Phases 0 to 4 complete on development data (2026-09-13): Phase 1 checks (a) to (g) pass; detectors pass look-ahead tests; synthetic curves are monotone; the TRI arm reproduces the index, three straddle cycles reconcile by hand, and the circular-shift null is calibrated at sealed length. Pre-registration locked under git tag `prereg-v1`. Next: Phase 5, the single sealed run.
+Phases 0 to 5 done (sealed run 20261006T141900Z, 2026-10-06; summary metrics in the ledger). Phase 6 partial: see `docs/results.md`. Phases 0 to 4 complete on development data (2026-09-13): Phase 1 checks (a) to (g) pass; detectors pass look-ahead tests; synthetic curves are monotone; the TRI arm reproduces the index, three straddle cycles reconcile by hand, and the circular-shift null is calibrated at sealed length. Pre-registration locked under git tag `prereg-v1`. Next: Phase 5, the single sealed run.
